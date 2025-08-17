@@ -95,8 +95,11 @@ YouTubeTranscriptApi._YouTubeTranscriptApi__session = session
 
 
 def fetch_transcript_text(video_id: str) -> str:
-    fetched = YouTubeTranscriptApi.get_transcript(video_id, languages=["en"])
-    return " ".join(snippet["text"] for snippet in fetched)
+    # youtube_transcript_api 1.2.2 returns iterable of FetchedTranscriptSnippet
+    ytt = YouTubeTranscriptApi()
+    fetched = ytt.fetch(video_id, languages=["en"])
+    text = " ".join(snippet.text for snippet in fetched)
+    return text
 
 def build_vector_store(text: str):
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
