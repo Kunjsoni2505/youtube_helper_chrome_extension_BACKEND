@@ -36,7 +36,7 @@ app = FastAPI()
 # Allow extension to call us
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:*/", "chrome-extension://*"],
+    allow_origins=["http://localhost:*/", "chrome-extension://*", "https://youtube-helper-chrome-extension-backend.onrender.com"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
