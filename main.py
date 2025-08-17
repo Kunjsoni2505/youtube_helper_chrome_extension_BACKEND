@@ -1,14 +1,16 @@
 import os
 import time
 from collections import defaultdict, deque
-from typing import Dict, Any, List
+from typing import Dict, Any
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
+import requests
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled
+from youtube_transcript_api._api import TranscriptApi
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
@@ -45,33 +47,23 @@ app.add_middleware(
 # -----------------------
 # In-memory caches/storage
 # -----------------------
-# Cache per video_id: {"vector": FAISS, "chunks": List[Document], "raw_text": str}
 VIDEO_CACHE: Dict[str, Dict[str, Any]] = {}
-
-# Simple IP-based daily rate limit: store timestamps of hits within today
 HITS: Dict[str, deque] = defaultdict(lambda: deque())
 
-# Reset window each day (midnight)
 def _day_bucket() -> int:
     return int(time.time() // 86400)
 
 CURRENT_BUCKET = _day_bucket()
 
-
 def rate_limit(remote: str) -> bool:
-    """
-    Return True if the requester is allowed; False if rate-limited.
-    """
     global CURRENT_BUCKET
     b = _day_bucket()
     if b != CURRENT_BUCKET:
-        # new day: clear hits
         HITS.clear()
         CURRENT_BUCKET = b
 
     dq = HITS[remote]
     now = time.time()
-    # keep only today's hits
     while dq and now - dq[0] > 86400:
         dq.popleft()
 
@@ -87,11 +79,22 @@ class ProcessInput(BaseModel):
     question: str
 
 
+# -----------------------
+# Transcript Fetch with User-Agent Patch
+# -----------------------
+session = requests.Session()
+session.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/114.0.0.0 Safari/537.36"
+    )
+})
+TranscriptApi._TranscriptApi__session = session
+
 def fetch_transcript_text(video_id: str) -> str:
-    # youtube_transcript_api 1.2.2 returns iterable of FetchedTranscriptSnippet
-    ytt = YouTubeTranscriptApi()
-    fetched = ytt.fetch(video_id, languages=["en"])
-    text = " ".join(snippet.text for snippet in fetched)
+    fetched = YouTubeTranscriptApi.get_transcript(video_id, languages=["en"])
+    text = " ".join(snippet["text"] for snippet in fetched)
     return text
 
 
@@ -146,7 +149,6 @@ async def process(req: Request, payload: ProcessInput):
     if not video_id or not question:
         return {"error": "video_id and question are required"}
 
-    # Get or build cache
     if video_id not in VIDEO_CACHE:
         try:
             text = fetch_transcript_text(video_id)
@@ -159,12 +161,10 @@ async def process(req: Request, payload: ProcessInput):
         VIDEO_CACHE[video_id] = {"vector": vs, "chunks": docs, "raw_text": text}
 
     vs = VIDEO_CACHE[video_id]["vector"]
-    # Retrieve top-k relevant chunks
     retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": 3})
     retrieved_docs = retriever.get_relevant_documents(question)
     context_text = "\n\n".join(doc.page_content for doc in retrieved_docs)
 
-    # If nothing retrieved, avoid empty call
     if not context_text.strip():
         return {
             "answer": "I don't know. The transcript didn't contain information for this question.",
@@ -172,7 +172,6 @@ async def process(req: Request, payload: ProcessInput):
             "video_id": video_id,
         }
 
-    # Ask Gemini
     try:
         answer = answer_with_gemini(context_text, question)
     except Exception as e:
