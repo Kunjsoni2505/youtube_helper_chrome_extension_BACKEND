@@ -5,4 +5,4 @@ youtube-transcript-api==1.2.2
 langchain==0.2.10
 langchain-community==0.2.10
 langchain-google-genai==1.0.7
-faiss-cpu==1.8.0
+faiss-cpu
