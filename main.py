@@ -98,5 +98,98 @@ def fetch_transcript_text(video_id: str) -> str:
     fetched = YouTubeTranscriptApi.get_transcript(video_id, languages=["en"])
     return " ".join(snippet["text"] for snippet in fetched)
 
+def build_vector_store(text: str):
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    docs = splitter.create_documents([text])
 
-# --- rest of your code unchanged (vector store, LLM, routes, etc.) ---
+    embeddings = GoogleGenerativeAIEmbeddings(
+        model=EMBED_MODEL,
+        google_api_key=GOOGLE_API_KEY
+    )
+    vs = FAISS.from_documents(docs, embeddings)
+    return vs, docs
+
+
+PROMPT = PromptTemplate(
+    template=(
+        "You are a helpful assistant.\n"
+        "Answer only from the provided transcript context.\n"
+        "If the content is insufficient, say you don't know.\n\n"
+        "{context}\n\n"
+        "Question: {question}"
+    ),
+    input_variables=["context", "question"],
+)
+
+def answer_with_gemini(context_text: str, question: str) -> str:
+    llm = ChatGoogleGenerativeAI(
+        model=GEN_MODEL,
+        google_api_key=GOOGLE_API_KEY,
+        temperature=0.3,
+    )
+    final_prompt = PROMPT.format(context=context_text, question=question)
+    resp = llm.invoke(final_prompt)
+    return getattr(resp, "content", str(resp))
+
+
+@app.post("/process")
+async def process(req: Request, payload: ProcessInput):
+    client_ip = req.client.host if req.client else "unknown"
+
+    allowed = rate_limit(client_ip)
+    if not allowed:
+        return {
+            "rate_limited": True,
+            "message": "Daily free limit reached. Try later or upgrade.",
+            "answer": None,
+        }
+
+    video_id = payload.video_id.strip()
+    question = payload.question.strip()
+    if not video_id or not question:
+        return {"error": "video_id and question are required"}
+
+    # Get or build cache
+    if video_id not in VIDEO_CACHE:
+        try:
+            text = fetch_transcript_text(video_id)
+        except TranscriptsDisabled:
+            return {"error": f"Transcripts are disabled for video {video_id}"}
+        except Exception as e:
+            return {"error": f"Transcript fetch error: {e}"}
+
+        vs, docs = build_vector_store(text)
+        VIDEO_CACHE[video_id] = {"vector": vs, "chunks": docs, "raw_text": text}
+
+    vs = VIDEO_CACHE[video_id]["vector"]
+    # Retrieve top-k relevant chunks
+    retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": 3})
+    retrieved_docs = retriever.get_relevant_documents(question)
+    context_text = "\n\n".join(doc.page_content for doc in retrieved_docs)
+
+    # If nothing retrieved, avoid empty call
+    if not context_text.strip():
+        return {
+            "answer": "I don't know. The transcript didn't contain information for this question.",
+            "rate_limited": False,
+            "video_id": video_id,
+        }
+
+    # Ask Gemini
+    try:
+        answer = answer_with_gemini(context_text, question)
+    except Exception as e:
+        return {"error": f"Gemini API error: {e}"}
+
+    return {
+        "answer": answer,
+        "rate_limited": False,
+        "video_id": video_id,
+        "used_chunks": len(retrieved_docs),
+    }
+
+
+@app.get("/")
+async def root():
+    return {"ok": True, "service": "yt-helper-backend"}
+
