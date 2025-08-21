@@ -8,10 +8,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-import requests
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled
-
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+# Import FAISS vector store
 try:
     from langchain_community.vectorstores import FAISS
 except Exception:
@@ -32,13 +32,10 @@ if not GOOGLE_API_KEY:
 
 app = FastAPI()
 
+# Allow extension to call us
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:*/",
-        "chrome-extension://*",
-        "https://youtube-helper-chrome-extension-backend.onrender.com",
-    ],
+    allow_origins=["http://localhost:*/", "chrome-extension://*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -74,28 +71,26 @@ def rate_limit(remote: str) -> bool:
     return True
 
 
+# -----------------------
+# Models
+# -----------------------
 class ProcessInput(BaseModel):
+    video_id: str
+    question: str
+
+class StoreTranscriptInput(BaseModel):
+    video_id: str
+    transcript_text: str
+
+class AskQuestionInput(BaseModel):
     video_id: str
     question: str
 
 
 # -----------------------
-# Transcript Fetch with User-Agent Patch
+# Helpers
 # -----------------------
-session = requests.Session()
-session.headers.update({
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/114.0.0.0 Safari/537.36"
-    )
-})
-# Patch the internal session used by YouTubeTranscriptApi
-YouTubeTranscriptApi._YouTubeTranscriptApi__session = session
-
-
 def fetch_transcript_text(video_id: str) -> str:
-    # youtube_transcript_api 1.2.2 returns iterable of FetchedTranscriptSnippet
     ytt = YouTubeTranscriptApi()
     fetched = ytt.fetch(video_id, languages=["en"])
     text = " ".join(snippet.text for snippet in fetched)
@@ -104,14 +99,11 @@ def fetch_transcript_text(video_id: str) -> str:
 def build_vector_store(text: str):
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     docs = splitter.create_documents([text])
-
     embeddings = GoogleGenerativeAIEmbeddings(
-        model=EMBED_MODEL,
-        google_api_key=GOOGLE_API_KEY
+        model=EMBED_MODEL, google_api_key=GOOGLE_API_KEY
     )
     vs = FAISS.from_documents(docs, embeddings)
     return vs, docs
-
 
 PROMPT = PromptTemplate(
     template=(
@@ -135,12 +127,66 @@ def answer_with_gemini(context_text: str, question: str) -> str:
     return getattr(resp, "content", str(resp))
 
 
+# -----------------------
+# Routes
+# -----------------------
+
+@app.post("/store_transcript")
+async def store_transcript(req: Request, payload: StoreTranscriptInput):
+    client_ip = req.client.host if req.client else "unknown"
+    if not rate_limit(client_ip):
+        return {"rate_limited": True, "message": "Daily free limit reached"}
+
+    video_id = payload.video_id.strip()
+    text = payload.transcript_text.strip()
+
+    if not video_id or not text:
+        return {"error": "video_id and transcript_text required"}
+
+    vs, docs = build_vector_store(text)
+    VIDEO_CACHE[video_id] = {"vector": vs, "chunks": docs, "raw_text": text}
+
+    return {"ok": True, "video_id": video_id, "chunks": len(docs)}
+
+
+@app.post("/ask_question")
+async def ask_question(req: Request, payload: AskQuestionInput):
+    client_ip = req.client.host if req.client else "unknown"
+    if not rate_limit(client_ip):
+        return {"rate_limited": True, "message": "Daily free limit reached"}
+
+    video_id = payload.video_id.strip()
+    question = payload.question.strip()
+
+    if not video_id or not question:
+        return {"error": "video_id and question required"}
+
+    if video_id not in VIDEO_CACHE:
+        return {"error": f"No transcript stored for video {video_id}"}
+
+    vs = VIDEO_CACHE[video_id]["vector"]
+    retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": 3})
+    retrieved_docs = retriever.get_relevant_documents(question)
+    context_text = "\n\n".join(doc.page_content for doc in retrieved_docs)
+
+    if not context_text.strip():
+        return {"answer": "I don't know. Transcript has no info.", "video_id": video_id}
+
+    try:
+        answer = answer_with_gemini(context_text, question)
+    except Exception as e:
+        return {"error": f"Gemini API error: {e}"}
+
+    return {"answer": answer, "video_id": video_id, "used_chunks": len(retrieved_docs)}
+
+
+# -----------------------
+# Legacy (still works)
+# -----------------------
 @app.post("/process")
 async def process(req: Request, payload: ProcessInput):
     client_ip = req.client.host if req.client else "unknown"
-
-    allowed = rate_limit(client_ip)
-    if not allowed:
+    if not rate_limit(client_ip):
         return {
             "rate_limited": True,
             "message": "Daily free limit reached. Try later or upgrade.",
@@ -152,7 +198,6 @@ async def process(req: Request, payload: ProcessInput):
     if not video_id or not question:
         return {"error": "video_id and question are required"}
 
-    # Get or build cache
     if video_id not in VIDEO_CACHE:
         try:
             text = fetch_transcript_text(video_id)
@@ -165,34 +210,24 @@ async def process(req: Request, payload: ProcessInput):
         VIDEO_CACHE[video_id] = {"vector": vs, "chunks": docs, "raw_text": text}
 
     vs = VIDEO_CACHE[video_id]["vector"]
-    # Retrieve top-k relevant chunks
     retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": 3})
     retrieved_docs = retriever.get_relevant_documents(question)
     context_text = "\n\n".join(doc.page_content for doc in retrieved_docs)
 
-    # If nothing retrieved, avoid empty call
     if not context_text.strip():
         return {
             "answer": "I don't know. The transcript didn't contain information for this question.",
-            "rate_limited": False,
             "video_id": video_id,
         }
 
-    # Ask Gemini
     try:
         answer = answer_with_gemini(context_text, question)
     except Exception as e:
         return {"error": f"Gemini API error: {e}"}
 
-    return {
-        "answer": answer,
-        "rate_limited": False,
-        "video_id": video_id,
-        "used_chunks": len(retrieved_docs),
-    }
+    return {"answer": answer, "video_id": video_id, "used_chunks": len(retrieved_docs)}
 
 
 @app.get("/")
 async def root():
     return {"ok": True, "service": "yt-helper-backend"}
-
